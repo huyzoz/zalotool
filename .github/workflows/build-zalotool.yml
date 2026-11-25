@@ -1,0 +1,229 @@
+# Build the ZaloTool dylib and inject it into the base 26.11.02.1 IPA.
+# The base IPA and the CydiaSubstrate framework zip are downloaded from
+# Google Drive (they are too large / not suitable to vendor in the repo),
+# and the finished IPA is published as a release on this repo by the
+# workflow itself (gh release create, GITHUB_TOKEN). The artifact upload
+# is kept as a backup.
+#
+# Hard guarantees:
+#  - The main Zalo binary is NEVER modified: its SHA-256 is asserted
+#    identical before injection and after repacking; any difference
+#    fails the job.
+#  - The dylib is built directly with clang++ (no Xcode project to drift).
+#    clang++ (not clang): the .mm source uses C++ exceptions (try/catch),
+#    so the C++ runtime (libc++) must be linked in.
+#  - hook_table_verified.json must match the base IPA (scripts/verify_hooks.py);
+#    a drift fails the job.
+#  - ldid -S is REQUIRED, not best-effort: every touched binary
+#    (patched BackupProtoLib, ZaloTool.dylib, CydiaSubstrate) is re-signed
+#    with its own real per-page hashes, and scripts/verify_signatures.py
+#    fails the job if any two touched binaries share an identical
+#    CodeDirectory (the template-signature crash of the old 261002 build).
+#  - MSHookMessageEx is resolved at runtime via dlopen + dlsym, because
+#    the shipped CydiaSubstrate binary carries LC_ID_DYLIB
+#    /usr/local/lib/libellekit.dylib — a link-time -framework reference
+#    would record a load path that does not exist on device.
+name: build-zalotool
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check hook_table_verified.json is well-formed
+        run: |
+          python3 -m json.tool hook_table_verified.json > /dev/null
+          echo "hook_table_verified.json is valid JSON."
+
+      - name: Build ZaloTool.dylib (arm64, iOS 15.0)
+        run: |
+          xcrun --sdk iphoneos clang++ -arch arm64 -mios-version-min=15.0 \
+            -dynamiclib -fobjc-arc -O2 -Wall \
+            -install_name @rpath/ZaloTool.dylib \
+            -framework Foundation -framework UIKit \
+            src/ZaloTool.mm \
+            -o ZaloTool.dylib
+          file ZaloTool.dylib
+          lipo -info ZaloTool.dylib
+          # MSHookMessageEx must be referenced (dlopen + dlsym by name:
+          # the symbol string must be present in the binary).
+          if ! strings ZaloTool.dylib | grep -q "MSHookMessageEx"; then
+            echo "::error::ZaloTool.dylib does not reference MSHookMessageEx"
+            exit 1
+          fi
+          if ! strings ZaloTool.dylib | grep -q "CydiaSubstrate.framework/CydiaSubstrate"; then
+            echo "::error::ZaloTool.dylib does not reference the CydiaSubstrate dlopen path"
+            exit 1
+          fi
+          # Init must live in __TEXT,__init_offsets (S_INIT_FUNC_OFFSETS),
+          # never in __mod_init_func. Modern ld64 on arm64 emits constructor
+          # functions there; fail loudly if the toolchain did otherwise.
+          otool -l ZaloTool.dylib | grep -E "sectname|segname" | grep -E "init_offsets|mod_init_func" || true
+          if otool -l ZaloTool.dylib | grep -q "__mod_init_func"; then
+            echo "::error::ZaloTool.dylib uses __mod_init_func (forbidden); expected __TEXT,__init_offsets"
+            exit 1
+          fi
+          if ! otool -l ZaloTool.dylib | grep -q "__init_offsets"; then
+            echo "::error::ZaloTool.dylib has no __TEXT,__init_offsets section"
+            otool -l ZaloTool.dylib | grep -E "sectname" || true
+            exit 1
+          fi
+          echo "Init section OK: __TEXT,__init_offsets present, no __mod_init_func."
+
+      - name: Download base IPA (Google Drive)
+        run: |
+          URL="https://drive.usercontent.google.com/download?id=1-vKwzeTwRn9FL_2xIN1jXxyeM9DAy0z1&export=download&confirm=t"
+          EXPECTED_SHA="3ea5625cb30a754f4b83042f7a70cc01a85db207ea06b98a32d9ef1d1d590864"
+          if ! curl -fL -o base.ipa "$URL"; then
+            echo "::error::Base IPA download failed from $URL"
+            exit 1
+          fi
+          ls -la base.ipa
+          ACTUAL_SHA=$(shasum -a 256 base.ipa | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Base IPA SHA-256 mismatch: got $ACTUAL_SHA, expected $EXPECTED_SHA (if the download returned an HTML page, the Drive file is not shared publicly)"
+            exit 1
+          fi
+          echo "Base IPA SHA-256 verified."
+
+      - name: Download CydiaSubstrate framework (Google Drive)
+        run: |
+          URL="https://drive.usercontent.google.com/download?id=1fFIY2APppDF061uuznT4KuZexCCnvcRh&export=download&confirm=t"
+          EXPECTED_SHA="714a54af0a3d2e08ff864a0736d19fb5e7e73980fed7280e36d4302a6fe1c66c"
+          if ! curl -fL -o framework.zip "$URL"; then
+            echo "::error::Framework zip download failed from $URL"
+            exit 1
+          fi
+          ls -la framework.zip
+          ACTUAL_SHA=$(shasum -a 256 framework.zip | awk '{print $1}')
+          if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Framework zip SHA-256 mismatch: got $ACTUAL_SHA, expected $EXPECTED_SHA (if the download returned an HTML page, the Drive file is not shared publicly)"
+            exit 1
+          fi
+          if ! unzip -l framework.zip | grep -q "CydiaSubstrate.framework/CydiaSubstrate"; then
+            echo "::error::Framework zip does not contain CydiaSubstrate.framework/CydiaSubstrate"
+            unzip -l framework.zip
+            exit 1
+          fi
+          echo "Framework zip SHA-256 verified."
+
+      - name: Verify hook table against the base IPA
+        run: |
+          python3 scripts/verify_hooks.py hook_table_verified.json --ipa base.ipa
+
+      - name: Unpack IPA
+        run: |
+          mkdir -p work && cd work
+          unzip -q ../base.ipa
+          ls Payload/
+          APP=$(ls -d Payload/*.app)
+          echo "APP=$APP" >> $GITHUB_ENV
+          # Record the main Zalo binary hash BEFORE any modification.
+          PLIST_BUDDY=/usr/libexec/PlistBuddy
+          EXE=$($PLIST_BUDDY -c "Print :CFBundleExecutable" "$APP/Info.plist")
+          echo "EXE=$EXE" >> $GITHUB_ENV
+          shasum -a 256 "$APP/$EXE" | awk '{print $1}' | tee ../zalo-before.txt
+
+      - name: Inject weak dylib load into BackupProtoLib (LIEF)
+        run: |
+          python3 -m pip install --break-system-packages lief
+          python3 scripts/inject_backupprotolib.py "work/$APP" --main-sha-file zalo-before.txt
+          mkdir -p "work/$APP/Frameworks"
+          cp ZaloTool.dylib "work/$APP/Frameworks/ZaloTool.dylib"
+          unzip -q -o framework.zip -d "work/$APP/Frameworks/"
+          echo "Frameworks/ after copy:"
+          find "work/$APP/Frameworks" -maxdepth 2 -type f | sort
+          # The framework zip must contain exactly the binary + Info.plist;
+          # the old build's marker/scratch files must never ship.
+          if [ -e "work/$APP/Frameworks/CydiaSubstrate.framework/.troll-fools" ]; then
+            echo "::error::.troll-fools marker present in CydiaSubstrate.framework — refusing to ship"
+            exit 1
+          fi
+          if [ -e "work/$APP/Frameworks/CydiaSubstrate.framework/CydiaSubstrate.classes.txt" ]; then
+            echo "::error::CydiaSubstrate.classes.txt present in CydiaSubstrate.framework — refusing to ship"
+            exit 1
+          fi
+          echo "Framework copy clean (.troll-fools and .classes.txt absent)."
+
+      - name: Assert main binary unchanged
+        run: |
+          shasum -a 256 "work/$APP/$EXE" | awk '{print $1}' | tee zalo-after.txt
+          diff zalo-before.txt zalo-after.txt || {
+            echo "::error::Main Zalo binary changed during the build — refusing to ship."
+            exit 1
+          }
+
+      - name: Re-sign touched binaries with ldid (REQUIRED)
+        # The old 261002 build crashed on tap because all touched binaries
+        # shared one template CodeDirectory. ldid -S recomputes each
+        # binary's own real per-page hashes. Any failure here fails the job.
+        run: |
+          brew install ldid
+          ldid -S "work/$APP/Frameworks/BackupProtoLib.framework/BackupProtoLib"
+          ldid -S "work/$APP/Frameworks/ZaloTool.dylib"
+          ldid -S "work/$APP/Frameworks/CydiaSubstrate.framework/CydiaSubstrate"
+          python3 scripts/verify_signatures.py \
+            "work/$APP/Frameworks/BackupProtoLib.framework/BackupProtoLib" \
+            "work/$APP/Frameworks/ZaloTool.dylib" \
+            "work/$APP/Frameworks/CydiaSubstrate.framework/CydiaSubstrate"
+          # Re-pack after signing (signing rewrites files in place).
+          cd work
+          zip -r -y ../ZaloTool-26.11.02.1.ipa Payload >/dev/null
+          cd ..
+          shasum -a 256 ZaloTool-26.11.02.1.ipa | tee ZaloTool-26.11.02.1.ipa.sha256
+          ls -la ZaloTool-26.11.02.1.ipa
+
+      - name: Assert LC_LOAD_WEAK_DYLIB present in final IPA
+        # Independent check that the mod actually loads: read BackupProtoLib
+        # out of the FINAL repacked IPA (after ldid re-pack) and fail if it
+        # has no weak-load command for ZaloTool.dylib.
+        run: |
+          rm -rf /tmp/final-ipa-check && mkdir -p /tmp/final-ipa-check
+          unzip -q ZaloTool-26.11.02.1.ipa -d /tmp/final-ipa-check
+          PROTO="/tmp/final-ipa-check/$APP/Frameworks/BackupProtoLib.framework/BackupProtoLib"
+          if ! otool -l "$PROTO" | grep -q "@rpath/ZaloTool.dylib"; then
+            echo "::error::Final IPA has no LC_LOAD_WEAK_DYLIB for @rpath/ZaloTool.dylib in BackupProtoLib"
+            otool -l "$PROTO" | grep -i "dylib\|rpath" || true
+            exit 1
+          fi
+          if ! otool -l "$PROTO" | grep -q "@executable_path/Frameworks"; then
+            echo "::error::Final IPA has no LC_RPATH @executable_path/Frameworks in BackupProtoLib"
+            exit 1
+          fi
+          echo "LC_LOAD_WEAK_DYLIB @rpath/ZaloTool.dylib + LC_RPATH present in final IPA."
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZaloTool-26.11.02.1.ipa
+          path: |
+            ZaloTool-26.11.02.1.ipa
+            ZaloTool-26.11.02.1.ipa.sha256
+
+      - name: Publish release (this repo)
+        # The workflow publishes the finished IPA itself on the repo it runs
+        # on (huyzoz/zalotool). Uses the default GITHUB_TOKEN (needs
+        # contents: write). gh reads GH_TOKEN from the environment; export
+        # it on the first script line (an env: block was tried before — the
+        # web editor mangled its indentation and broke the YAML, so keep it
+        # a single script line, no new YAML structure).
+        run: |
+          export GH_TOKEN="${{ github.token }}"
+          if gh release view v26.11.02.1-mod >/dev/null 2>&1; then
+            gh release upload v26.11.02.1-mod --clobber \
+              ZaloTool-26.11.02.1.ipa ZaloTool-26.11.02.1.ipa.sha256
+          else
+            gh release create v26.11.02.1-mod \
+              --title "Zalo iOS 26.11.02.1 — Mod" \
+              --notes-file RELEASE-NOTES.md \
+              ZaloTool-26.11.02.1.ipa ZaloTool-26.11.02.1.ipa.sha256
+          fi
+          gh release view v26.11.02.1-mod --json tagName,url,assets --jq '{url, assets: [.assets[] | .name]}'
