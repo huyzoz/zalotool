@@ -91,7 +91,7 @@ static NSMutableDictionary<NSString *, NSValue *> *g_origIMPs = nil;
 
 static void ZMStoreOrig(SEL sel, IMP orig) {
     if (!sel || !orig || !g_origIMPs) return;
-    g_origIMPs[NSStringFromSelector(sel)] = [NSValue valueWithPointer:orig];
+    g_origIMPs[NSStringFromSelector(sel)] = [NSValue valueWithPointer:(const void *)orig];
 }
 
 static IMP ZMOrigForSel(SEL sel) {
